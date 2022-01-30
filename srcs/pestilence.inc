@@ -6,6 +6,7 @@
 %define		VIRUS_SIZE			((_finish - _start))
 
 ; SYSCALLS defines
+%define		SYS_READ			0
 %define		SYS_WRITE			1
 %define		SYS_OPEN			2
 %define		SYS_CLOSE			3
@@ -17,6 +18,7 @@
 %define		SYS_FTRUNCATE		77
 %define		SYS_GETENTS			78
 %define		SYS_CHMOD			90
+%define		SYS_PTRACE			101
 
 ; MMAP defines
 %define		PROT_READ			0x1
@@ -124,6 +126,8 @@ struc	famine
 	.current_fpath:	resb	PATH_MAX
 	.fsize:			resq	1
 	.mmap_size:		resq	1
+
+	.comm_content:	resb	0x10
 endstruc
 
 
